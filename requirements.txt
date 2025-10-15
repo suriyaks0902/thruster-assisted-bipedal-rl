@@ -1,0 +1,38 @@
+# Core dependencies
+numpy>=1.21.0
+scipy>=1.9.0
+matplotlib>=3.5.0
+pillow>=9.0.0
+h5py>=3.7.0
+pyyaml>=6.0
+tqdm>=4.64.0
+seaborn>=0.11.0
+pandas>=1.5.0
+
+# Deep Learning and RL
+tensorflow>=2.12.0,<2.16.0
+gym>=0.26.0
+tensorboard>=2.12.0
+
+# Physics and Robotics
+mujoco>=2.3.0
+mujoco-py>=2.1.0
+kinpy>=0.0.15
+
+# Parallel Computing
+mpi4py>=3.1.0
+
+# Computer Vision
+opencv-python>=4.6.0
+
+# Protocol Buffers (compatible with TensorFlow)
+protobuf>=3.20.3,<5.0.0
+
+# Development tools (optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=5.0.0
+mypy>=1.0.0
+
+# GPU specific
+cuda-python>=12.0.0

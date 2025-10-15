@@ -1,0 +1,9 @@
+{
+  "waypoint_strategy": "random",
+  "sequence_type": "mixed",
+  "learning_rate": 1e-05,
+  "max_iters": 100,
+  "timesteps_per_batch": 2048,
+  "batch_size": 64,
+  "test_mode": false
+}
