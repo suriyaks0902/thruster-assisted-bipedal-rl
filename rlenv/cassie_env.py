@@ -24,8 +24,14 @@ class CassieEnv:
         self.safe_action_bounds[:, [1, 6]] *= 0.8
         # Thruster actions don't need safety scaling
         self.base_idx = [0, 1, 2, 3, 4, 5, 6]
-        self.motor_idx = [7, 8, 9, 14, 20, 21, 22, 23, 28, 34]
-        self.motor_vel_idx = [6, 7, 8, 12, 18, 19, 20, 21, 25, 31]
+        self.thruster_pitch_idx = [7, 8]
+        self.thruster_pitch_vel_idx = [6, 7]
+
+        self.motor_idx = [9, 10, 11, 16, 22, 23, 24, 25, 30, 36]
+        self.motor_vel_idx = [8, 9, 10, 14, 20, 21, 22, 23, 27, 33]
+        self.all_motor_idx = self.thruster_pitch_idx + self.motor_idx
+        self.all_motor_vel_idx = self.thruster_pitch_vel_idx + self.motor_vel_idx
+
         self.pGain = np.copy(DEFAULT_PGAIN)
         self.dGain = np.copy(DEFAULT_DGAIN)
         self.offset_footJoint2midFoot = np.sqrt(0.01762**2 + 0.05219**2)
@@ -46,9 +52,11 @@ class CassieEnv:
         self.obs_cassie_state = state_out_t()
         self.cassie_out = cassie_out_t()
         self.u = self._init_u()
-        self.num_motor = 10
-        self.num_thruster = 2  # left_force, right_force (site-based thrusters only)
-        self.num_total_actions = self.num_motor + self.num_thruster
+        self.num_leg_motors = 10
+        self.num_thruster_pitch_motors = 2
+        self.num_motor = 12  # Total motors
+        self.num_thruster_forces = 2  # Site-based forces (if still using)
+        self.num_total_actions = self.num_motor + self.num_thruster_forces  # 14 or 12
         
         # Initialize thruster variables
         self.thruster_forces = [0.0, 0.0]  # [left, right]
@@ -331,7 +339,7 @@ class CassieEnv:
             highcut=[4],
             sampling_rate=self.real_env_freq,
             order=self.action_filter_order,
-            num_joints=self.num_motor,
+            num_joints=12,
         )
 
     def __init_env_randomlizer(self):
@@ -370,7 +378,7 @@ class CassieEnv:
         self.action_filter.reset()
         noise_rot_magnitute, _, _, _ = self.env_randomlizer.get_rand_nosie()
         default_action = (
-            self.qpos[self.motor_idx]
+            self.qpos[self.all_motor_idx]
             + np.random.normal(size=self.num_motor) * noise_rot_magnitute
         )
         self.action_filter.init_history(default_action)
@@ -433,7 +441,7 @@ class CassieEnv:
         self.sim.foot_pos(self.foot_pos)
         self.init_foot_pos = self.foot_pos
         self.applied_force = np.zeros((6,))
-        self.last_acs = self.qpos[self.motor_idx]
+        self.last_acs = self.qpos[self.all_motor_idx]
 
     def __set_dynamics_properties(self):
         if self.minimal_rand:
@@ -469,12 +477,19 @@ class CassieEnv:
     def __step_sim_nominal(self, actual_pTs_filtered):
         # 1 control_step = 0.0005s / 2kHz
         self.u.leftLeg.motorPd.pTarget[:5] = actual_pTs_filtered[:5]
-        self.u.rightLeg.motorPd.pTarget[:5] = actual_pTs_filtered[5:]
+        self.u.rightLeg.motorPd.pTarget[:5] = actual_pTs_filtered[5:10]
+
+        thruster_left = actual_pTs_filtered[10]
+        thruster_right = actual_pTs_filtered[11]
         for _ in range(self.num_sims_per_env_step):
             # give pTargets to motors
             self.obs_cassie_state = self.sim.estimate_state(
                 self.sim.step_pd_without_estimation(self.u)
             )
+            qpos = np.copy(self.sim.qpos())
+            qpos[7] = thruster_left
+            qpos[8] = thruster_right
+            self.sim.set_qpos(qpos)
 
     def __step_sim_zerotorque(self, actual_pTs_filtered):
         # 1 control_step = 0.0005s / 2kHz
@@ -621,6 +636,9 @@ class CassieEnv:
         cassie_out.rightLeg.hipPitchDrive.position = mpos[7]
         cassie_out.rightLeg.kneeDrive.position = mpos[8]
         cassie_out.rightLeg.footDrive.position = mpos[9]
+        # # motor, thruster pitch
+        # cassie_out.thruster_left_pitch.position = mpos[10]  
+        # cassie_out.thruster_right_pitch.position = mpos[11]
         return cassie_out
 
     def __apply_perturbation(self):
@@ -640,7 +658,7 @@ class CassieEnv:
     ##########################################
     #              Observation               #
     ##########################################
-    def __get_observation(self, acs=np.zeros(10), step=False):
+    def __get_observation(self, acs=np.zeros(12), step=False):
         ref_dict_1 = self.reference_generator.get_ref_motion(look_forward=1)
         ref_dict_4 = self.reference_generator.get_ref_motion(look_forward=4)
         ref_dict_7 = self.reference_generator.get_ref_motion(look_forward=7)
@@ -665,8 +683,8 @@ class CassieEnv:
                 self.qvel[[0, 1, 2]],
                 self.qacc[[0, 1, 2]],
                 self.qpos[3:7],
-                self.qpos[self.motor_idx],
-                self.qvel[self.motor_vel_idx],
+                self.qpos[self.all_motor_idx],
+                self.qvel[self.all_motor_vel_idx], # all 12 velocities
             ]
         )
 
@@ -682,12 +700,12 @@ class CassieEnv:
         if self.timestep == 0:
             [self.previous_obs.append(ob_curr) for i in range(self.history_len_vf)]
             [
-                self.previous_acs.append(np.zeros(self.num_motor))
+                self.previous_acs.append(np.zeros(12))
                 for _ in range(self.history_len_vf)
             ]
             [
                 self.long_history.append(
-                    np.concatenate([ob_curr, np.zeros(self.num_motor)])
+                    np.concatenate([ob_curr, np.zeros(12)])
                 )
                 for _ in range(self.history_len_pol)
             ]
@@ -739,12 +757,12 @@ class CassieEnv:
     def __get_reward(self, acs):
         # NOTE: reward is using qpos/qvel that don't have noise and delay
         mpos_err = np.sum(
-            np.square(self.ref_dict["motor_pos"] - self.qpos[self.motor_idx])
+            np.square(self.ref_dict["motor_pos"] - self.qpos[self.all_motor_idx])
         )
         r_mpos = np.exp(self.reward_scales["mpos"] * mpos_err)
 
         mvel_err = np.sum(
-            np.square(self.ref_dict["motor_vel"] - self.qvel[self.motor_vel_idx])
+            np.square(self.ref_dict["motor_vel"] - self.qvel[self.all_motor_vel_idx])
         )
         if not self.reference_generator.in_stand_mode:
             r_mvel = np.exp(self.reward_scales["mvel"] * mvel_err)
@@ -834,7 +852,7 @@ class CassieEnv:
         ref_footpos = self.get_foot_pos_absolute(
             self.ref_dict["base_pos_global"],
             self.ref_dict["base_rot_global"],
-            self.ref_dict["motor_pos"],
+            self.ref_dict["motor_pos"][:10],  # [:10] only pass leg motor positions
         )
         foot_pos_err = np.sum(
             np.square(
@@ -950,15 +968,21 @@ class CassieEnv:
     #                 Utils                  #
     ##########################################
     def acs_actual2norm(self, actual_acs):
-        # Only use motor action bounds (first 10 elements)
-        motor_bounds = self.safe_action_bounds[:, :self.num_motor]
+        # Bounds for 10 leg motors and 2 thruster pitch motors
+        motor_bounds = np.concatenate([
+            self.safe_action_bounds[:, :10],  # Leg motors
+            self.safe_action_bounds[:, 12:14]  # Thruster pitch motors
+        ], axis=1)
         return (actual_acs - motor_bounds[0]) * 2 / (
             motor_bounds[1] - motor_bounds[0]
         ) - 1
 
     def acs_norm2actual(self, acs):
-        # Only use motor action bounds (first 10 elements)
-        motor_bounds = self.safe_action_bounds[:, :self.num_motor]
+        # Bounds for 10 leg motors and 2 thruster pitch motors
+        motor_bounds = np.concatenate([
+            self.safe_action_bounds[:, :10],  # Leg motors
+            self.safe_action_bounds[:, 12:14]  # Thruster pitch motors
+        ], axis=1)
         return motor_bounds[0] + (acs + 1) / 2.0 * (
             motor_bounds[1] - motor_bounds[0]
         )
@@ -977,7 +1001,9 @@ class CassieEnv:
             qpos = np.copy(self.sim.qpos())
             qvel = np.copy(self.sim.qvel())
 
-            qpos[self.motor_idx] = motor_pos
+            qpos[self.motor_idx] = motor_pos[:10]
+            qpos[7] = motor_pos[10]  # left thruster pitch
+            qpos[8] = motor_pos[11]  # right thruster pitch
             qpos[self.base_idx] = base_pos
 
             self.sim.set_qpos(qpos)
@@ -1003,9 +1029,10 @@ class CassieEnv:
         return self.vis.draw(self.sim)
 
     def _calc_torque(self, actual_pTs):
-        torques = self.pGain * (
-            actual_pTs - np.array(self.obs_cassie_state.motor.position)
-        ) - self.dGain * np.array(self.obs_cassie_state.motor.velocity)
+        leg_pTs = actual_pTs[:10]
+        torques = self.pGain[:10] * (
+            leg_pTs - np.array(self.obs_cassie_state.motor.position)
+        ) - self.dGain[:10] * np.array(self.obs_cassie_state.motor.velocity)
         return torques
 
     def get_foot_pos_relative(self, base_rot, motor_pos):

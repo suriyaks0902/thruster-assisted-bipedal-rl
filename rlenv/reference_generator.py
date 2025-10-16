@@ -20,17 +20,18 @@ class ReferenceGenerator:
         secs_per_env_step,
         config,
     ):
+        
+        # added thruster pitch tracking
+        self.num_thruster_motors = 2
+        self.num_leg_motors = 10
+        self.total_motors = 12
+
+        
         self.cmd_generator = CmdGenerateor(env_max_timesteps, secs_per_env_step, config)
         self.gait_library = GaitLibrary(secs_per_env_step)
         self.time_stand_transit_cooling = 3.0  # allow 3 sec to transit to standing
         self.norminal_standing = np.copy(STANDING_POSE)
         self.add_standing = config["add_standing"]
-        
-        # Initialize hopping mode if enabled
-        self.hopping_mode = config.get('hopping_mode', False)
-        if self.hopping_mode:
-            self.__init_hopping_reference(config)
-        
         self.reset()
 
     def reset(self):
@@ -89,28 +90,9 @@ class ReferenceGenerator:
         self.last_ref_rotparams = ref_rotparams
 
     def get_init_pose(self):
-        # For hopping mode, use the standard standing pose
-        if self.hopping_mode:
-            # Use the standard Cassie standing pose that respects constraints
-            ref_base_pos = np.array([0.0, 0.0, 0.95])  # Standard height
-            ref_base_rot = np.array([[0.0, 0.0, 0.0]])  # No rotation
-            ref_mpos = np.array([
-                0.0,     # left hip roll
-                0.0,     # left hip yaw  
-                0.4544,  # left hip pitch (standard standing)
-                -1.21,   # left knee (standard standing)
-                -1.643,  # left foot (standard standing)
-                0.0,     # right hip roll
-                0.0,     # right hip yaw
-                0.4544,  # right hip pitch (standard standing)
-                -1.21,   # right knee (standard standing)
-                -1.643,  # right foot (standard standing)
-            ])
-            return ref_base_pos, ref_base_rot, ref_mpos
-        
-        # Original logic for normal walking mode
+        # should reset ref env first then use this function
         init_gait_params = self.gait_library.get_random_init_gaitparams()
-        ref_mpos = self.gait_library.get_ref_states(init_gait_params)
+        ref_mpos_legs = self.gait_library.get_ref_states(init_gait_params)
         ref_base_pos_from_cmd, _ = self.cmd_generator.get_ref_base_global()
         ref_base_pos = np.array(
             [
@@ -128,24 +110,24 @@ class ReferenceGenerator:
             ]
         ).reshape((1, 3))
         if norminal_pose_flag:
-            ref_base_pos, _, ref_mpos = self.norminal_pose
+            ref_base_pos, _, ref_mpos_legs = self.norminal_pose
             stand_abduction_offset = np.radians(np.random.uniform(-1.0, 7.5, (2,)))
-            ref_mpos[0] = ref_mpos[0] + stand_abduction_offset[0]
-            ref_mpos[5] = ref_mpos[5] - stand_abduction_offset[1]
+            ref_mpos_legs[0] = ref_mpos_legs[0] + stand_abduction_offset[0]
+            ref_mpos_legs[5] = ref_mpos_legs[5] - stand_abduction_offset[1]
             stand_knee_offset = np.radians(np.random.uniform(-5.0, 5.0, (2,)))
             stand_thigh_offset = np.radians(np.random.uniform(-5.0, 5.0, (2,)))
-            ref_mpos[3] += stand_knee_offset[0]
-            ref_mpos[3 + 5] += stand_knee_offset[1]
-            ref_mpos[2] += stand_thigh_offset[0]
-            ref_mpos[2 + 5] += stand_thigh_offset[1]
+            ref_mpos_legs[3] += stand_knee_offset[0]
+            ref_mpos_legs[3 + 5] += stand_knee_offset[1]
+            ref_mpos_legs[2] += stand_thigh_offset[0]
+            ref_mpos_legs[2 + 5] += stand_thigh_offset[1]
             ref_base_pos[2] += np.random.uniform(-0.05, 0.05)
+
+        # Append 2 thruster pitch motors (neutral position)
+        ref_mpos_thrusters = np.array([0.0, 0.0])
+        ref_mpos = np.concatenate([ref_mpos_legs, ref_mpos_thrusters]) # now its 12 motors
         return ref_base_pos, ref_base_rot, ref_mpos
 
     def get_ref_motion(self, look_forward=0):
-        if self.hopping_mode:
-            # Use hopping reference motion
-            return self.get_hopping_reference(self.time_in_sec)
-        
         ref_dict = dict()
         ref_gait_params = self.cmd_generator.curr_ref_gaitparams
         ref_rot_params = self.cmd_generator.curr_ref_rotcmds
@@ -153,7 +135,10 @@ class ReferenceGenerator:
             ref_base_pos_from_cmd,
             ref_base_rot_from_cmd,
         ) = self.cmd_generator.get_ref_base_global()
-        ref_mpos = self.gait_library.get_ref_states(ref_gait_params, look_forward)
+        ref_mpos_legs = self.gait_library.get_ref_states(ref_gait_params, look_forward)
+        # get thruster pitch motor reference 
+        ref_mpos_thrusters = self._get_thruster_pitch_for_walking(ref_gait_params, ref_rot_params)
+        
         ref_dict["base_pos_global"] = np.array(
             [*ref_base_pos_from_cmd, ref_gait_params[-1]]
         )
@@ -162,17 +147,149 @@ class ReferenceGenerator:
             [ref_gait_params[0], ref_gait_params[1], ref_rot_params[-1]]
         )  # vx vy vyaw
         if self.start_standing:
-            ref_dict["motor_pos"] = self.norminal_mpos
-            ref_dict["motor_vel"] = np.zeros((10,))
+            ref_dict["motor_pos"] = np.concatenate([self.norminal_mpos, np.array([0.0, 0.0])])
+            ref_dict["motor_vel"] = np.zeros((12,))
         else:
-            ref_dict["motor_pos"] = ref_mpos
-            ref_dict["motor_vel"] = np.zeros((10,))  # ref_mvel
+            ref_dict["motor_pos"] = np.concatenate([ref_mpos_legs, ref_mpos_thrusters])
+            ref_dict["motor_vel"] = np.zeros((12,))  # ref_mvel
         return ref_dict
 
     def get_curr_params(self):
         ref_gait_params = self.cmd_generator.curr_ref_gaitparams
         ref_rot_params = self.cmd_generator.curr_ref_rotcmds
         return ref_gait_params, ref_rot_params
+
+    def _get_thruster_pitch_for_walking(self, gait_params, rot_params):
+        """
+        Generate thruster pitch angles to assist walking.
+        Returns: [left_pitch, right_pitch] in radians
+        """
+        vx = gait_params[0]  # Forward velocity
+        vy = gait_params[1]  # Lateral velocity
+        vyaw = rot_params[-1]  # Turning rate
+        
+        # Base strategy: thrusters help with forward propulsion
+        if abs(vx) > 0.3:
+            # Fast forward walking: tilt back slightly for propulsion assist
+            pitch_angle = np.clip(-10.0 * vx, -20.0, 5.0)  # -20° to +5°
+            left_pitch = np.radians(pitch_angle)
+            right_pitch = np.radians(pitch_angle)
+        
+        elif abs(vy) > 0.2:
+            # Lateral walking: differential angles for balance
+            left_pitch = np.radians(-5.0 * vy)
+            right_pitch = np.radians(5.0 * vy)
+        
+        elif abs(vyaw) > 0.1:
+            # Turning: differential thrust for stability
+            left_pitch = np.radians(-10.0 * vyaw)
+            right_pitch = np.radians(10.0 * vyaw)
+        
+        else:
+            # Slow walking or standing: neutral position
+            left_pitch = 0.0
+            right_pitch = 0.0
+        
+        return np.array([left_pitch, right_pitch])
+
+    def get_jump_reference(self, jump_time):
+        """
+        Generate reference for a single jump-and-land maneuver.
+        
+        Args:
+            jump_time: Time since jump started (0 = start of jump)
+        
+        Returns:
+            ref_dict with 12 motor positions
+        """
+        ref_dict = dict()
+        
+        # Base standing pose
+        standing_legs = self.norminal_mpos  # 10 leg motors
+        
+        # Jump phases (total ~2-3 seconds)
+        CROUCH_TIME = 0.5      # 0.0 - 0.5s: Crouch down
+        LAUNCH_TIME = 0.3      # 0.5 - 0.8s: Explosive launch
+        FLIGHT_TIME = 0.7      # 0.8 - 1.5s: In air
+        LANDING_TIME = 0.5     # 1.5 - 2.0s: Land and absorb
+        STABILIZE_TIME = 0.5   # 2.0 - 2.5s: Return to standing
+        
+        if jump_time < CROUCH_TIME:
+            # Phase 1: CROUCH - bend legs, tilt thrusters down
+            phase = jump_time / CROUCH_TIME
+            
+            # Leg motors: bend knees (index 3, 8 are hip-pitch; 4, 9 are knees)
+            leg_pos = standing_legs.copy()
+            leg_pos[3] -= 0.3 * phase  # Left hip pitch
+            leg_pos[4] += 0.5 * phase  # Left knee bend
+            leg_pos[8] -= 0.3 * phase  # Right hip pitch
+            leg_pos[9] += 0.5 * phase  # Right knee bend
+            
+            # Thruster motors: tilt down to -30° for pre-launch
+            thruster_pitch = [-30.0 * phase, -30.0 * phase]
+            thruster_pitch = np.radians(thruster_pitch)
+        
+        elif jump_time < CROUCH_TIME + LAUNCH_TIME:
+            # Phase 2: LAUNCH - explosive leg extension + thruster fire
+            phase = (jump_time - CROUCH_TIME) / LAUNCH_TIME
+            
+            # Leg motors: rapid extension
+            leg_pos = standing_legs.copy()
+            leg_pos[3] += 0.2 * phase  # Extend hips
+            leg_pos[4] -= 0.3 * phase  # Extend knees
+            leg_pos[8] += 0.2 * phase
+            leg_pos[9] -= 0.3 * phase
+            
+            # Thruster motors: -30° → 0° (vertical) for max upward thrust
+            angle = -30.0 + (30.0 * phase)
+            thruster_pitch = np.radians([angle, angle])
+        
+        elif jump_time < CROUCH_TIME + LAUNCH_TIME + FLIGHT_TIME:
+            # Phase 3: FLIGHT - tuck legs, thrusters slightly forward
+            phase = (jump_time - CROUCH_TIME - LAUNCH_TIME) / FLIGHT_TIME
+            
+            # Leg motors: tuck for flight
+            leg_pos = standing_legs.copy()
+            leg_pos[3] -= 0.4 * phase
+            leg_pos[4] += 0.8 * phase  # Tuck knees
+            leg_pos[8] -= 0.4 * phase
+            leg_pos[9] += 0.8 * phase
+            
+            # Thruster motors: slight forward tilt for stabilization
+            thruster_pitch = np.radians([10.0, 10.0])
+        
+        elif jump_time < CROUCH_TIME + LAUNCH_TIME + FLIGHT_TIME + LANDING_TIME:
+            # Phase 4: LANDING - extend legs, thrusters down for soft landing
+            phase = (jump_time - CROUCH_TIME - LAUNCH_TIME - FLIGHT_TIME) / LANDING_TIME
+            
+            # Leg motors: prepare for impact
+            leg_pos = standing_legs.copy()
+            leg_pos[3] += 0.1 * (1 - phase)
+            leg_pos[4] += 0.3 * (1 - phase)  # Slight bend to absorb
+            leg_pos[8] += 0.1 * (1 - phase)
+            leg_pos[9] += 0.3 * (1 - phase)
+            
+            # Thruster motors: tilt down for landing assist
+            angle = 10.0 - (40.0 * phase)  # 10° → -30°
+            thruster_pitch = np.radians([angle, angle])
+        
+        else:
+            # Phase 5: STABILIZE - return to normal standing
+            phase = min(1.0, (jump_time - CROUCH_TIME - LAUNCH_TIME - FLIGHT_TIME - LANDING_TIME) / STABILIZE_TIME)
+            
+            # Leg motors: return to standing
+            leg_pos = standing_legs.copy()
+            
+            # Thruster motors: return to neutral
+            angle = -30.0 * (1 - phase)  # -30° → 0°
+            thruster_pitch = np.radians([angle, angle])
+        
+        # Combine 12 motors
+        ref_dict["motor_pos"] = np.concatenate([leg_pos, thruster_pitch])
+        ref_dict["motor_vel"] = np.zeros(12)
+        ref_dict["base_vel_local"] = np.zeros(3)
+        
+        return ref_dict
 
     @property
     def norminal_pose(self):
@@ -204,240 +321,3 @@ class ReferenceGenerator:
     @property
     def in_stand_mode(self):
         return self.start_standing
-
-    def __init_hopping_reference(self, config):
-        """Initialize jumping-specific reference motion parameters"""
-        self.jump_target_height = config.get('hop_target_height', 1.5)  # Keep same parameter name for compatibility
-        self.jump_preparation_time = 3.0  # Time to prepare for jump
-        self.jump_execution_time = 4.0    # Time for jump execution and landing
-        self.jump_phase = 0.0  # Current jumping phase
-        self.jump_amplitude = (self.jump_target_height - 1.0) / 2.0  # Height amplitude
-        
-        # Define jumping phases for single explosive jump
-        self.jump_phases = {
-            'stand': 0,           # Standing still, preparing
-            'crouch': 1,          # Compress legs for jump
-            'explode': 2,         # Explosive leg extension + thruster boost
-            'flight': 3,          # Air phase with thruster stabilization
-            'landing_prep': 4,    # Prepare legs for landing
-            'landing': 5,         # Land with leg and thruster assistance
-            'stabilize': 6        # Return to stable standing
-        }
-        
-        # Thruster reference values for jumping (scaled to match model limits)
-        self.thruster_explosive_force = 8.0  # N - scaled to model's 10N limit
-        self.thruster_landing_force = 6.0    # N - for controlled landing
-        self.thruster_stabilization_angle = 0.1  # rad - minimal angle for stability
-
-    def __calculate_kinematic_pose(self, phase_weight, phase_type):
-        """
-        Calculate proper joint angles using kinematics principles
-        :param phase_weight: 0-1 weight for phase transition
-        :param phase_type: 'stand', 'crouch', 'explode', 'flight', 'landing_prep', 'landing', 'stabilize'
-        :return: joint angles for symmetric leg movement
-        """
-        # Base standing pose joint angles
-        base_pose = np.copy(STANDING_POSE)
-        
-        if phase_type == 'stand':
-            # Standing still, preparing for jump
-            return {
-                'left_hip_pitch': base_pose[3],
-                'left_knee': base_pose[4],
-                'right_hip_pitch': base_pose[8],
-                'right_knee': base_pose[9]
-            }
-            
-        elif phase_type == 'crouch':
-            # Compress legs symmetrically for jump preparation
-            # Use inverse kinematics to find joint angles for compressed stance
-            compression_factor = 0.1 * phase_weight  # Much more conservative
-            
-            # Symmetric leg compression (much more conservative)
-            left_hip_compression = -compression_factor
-            left_knee_compression = compression_factor * 1.0  # Reduced from 2.5
-            right_hip_compression = -compression_factor  
-            right_knee_compression = compression_factor * 1.0  # Reduced from 2.5
-            
-            return {
-                'left_hip_pitch': base_pose[3] + left_hip_compression,
-                'left_knee': base_pose[4] + left_knee_compression,
-                'right_hip_pitch': base_pose[8] + right_hip_compression,
-                'right_knee': base_pose[9] + right_knee_compression
-            }
-            
-        elif phase_type == 'explode':
-            # Explosive leg extension for maximum jump power
-            # Use forward kinematics to ensure both legs extend equally and powerfully
-            extension_factor = 0.2 * phase_weight  # Much more conservative
-            
-            left_hip_extension = extension_factor
-            left_knee_extension = -extension_factor * 0.5  # Much more conservative
-            right_hip_extension = extension_factor
-            right_knee_extension = -extension_factor * 0.5  # Much more conservative
-            
-            return {
-                'left_hip_pitch': base_pose[3] + left_hip_extension,
-                'left_knee': base_pose[4] + left_knee_extension,
-                'right_hip_pitch': base_pose[8] + right_hip_extension,
-                'right_knee': base_pose[9] + right_knee_extension
-            }
-            
-        elif phase_type == 'flight':
-            # Fold legs symmetrically for flight phase
-            # Ensure both legs fold equally to maintain balance and reduce drag
-            fold_factor = 0.4 * phase_weight
-            
-            left_hip_fold = -fold_factor
-            left_knee_fold = fold_factor * 2.0  # More aggressive folding
-            right_hip_fold = -fold_factor
-            right_knee_fold = fold_factor * 2.0
-            
-            return {
-                'left_hip_pitch': base_pose[3] + left_hip_fold,
-                'left_knee': base_pose[4] + left_knee_fold,
-                'right_hip_pitch': base_pose[8] + right_hip_fold,
-                'right_knee': base_pose[9] + right_knee_fold
-            }
-            
-        elif phase_type == 'landing_prep':
-            # Extend legs symmetrically for landing preparation
-            # Use inverse kinematics to prepare for impact absorption
-            extension_factor = 0.5 * phase_weight
-            
-            left_hip_extension = extension_factor
-            left_knee_extension = -extension_factor * 1.2
-            right_hip_extension = extension_factor
-            right_knee_extension = -extension_factor * 1.2
-            
-            return {
-                'left_hip_pitch': base_pose[3] + left_hip_extension,
-                'left_knee': base_pose[4] + left_knee_extension,
-                'right_hip_pitch': base_pose[8] + right_hip_extension,
-                'right_knee': base_pose[9] + right_knee_extension
-            }
-            
-        elif phase_type == 'landing':
-            # Compress legs symmetrically for landing impact
-            # Use forward kinematics to absorb impact equally
-            compression_factor = 0.2 * phase_weight
-            
-            left_hip_compression = -compression_factor
-            left_knee_compression = compression_factor * 1.5
-            right_hip_compression = -compression_factor
-            right_knee_compression = compression_factor * 1.5
-            
-            return {
-                'left_hip_pitch': base_pose[3] + left_hip_compression,
-                'left_knee': base_pose[4] + left_knee_compression,
-                'right_hip_pitch': base_pose[8] + right_hip_compression,
-                'right_knee': base_pose[9] + right_knee_compression
-            }
-            
-        else:  # stabilize
-            # Return to standing pose symmetrically
-            # Use inverse kinematics to ensure both legs return to exact standing position
-            return {
-                'left_hip_pitch': base_pose[3],
-                'left_knee': base_pose[4],
-                'right_hip_pitch': base_pose[8],
-                'right_knee': base_pose[9]
-            }
-
-    def get_hopping_reference(self, time_in_sec):
-        """Generate coordinated leg and thruster jumping reference motion using kinematics"""
-        # Calculate jumping phase based on time
-        total_jump_time = self.jump_preparation_time + self.jump_execution_time
-        
-        # Start with standing pose as base
-        ref_pose = np.copy(STANDING_POSE)
-        
-        # Determine phase and apply coordinated leg + thruster action
-        if time_in_sec < 2.0:  # Extended stabilization phase - just stand still
-            # Keep standing pose for first 2 seconds to stabilize
-            thruster_force = 0.0
-            thruster_angle = 0.0
-        elif time_in_sec < self.jump_preparation_time:  # Preparation phase
-            phase_weight = (time_in_sec - 2.0) / (self.jump_preparation_time - 2.0)
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'crouch')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = 0.0
-            thruster_angle = 0.0
-            
-        elif time_in_sec < self.jump_preparation_time + 0.5:  # Explosive jump phase
-            phase_weight = (time_in_sec - self.jump_preparation_time) / 0.5
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'explode')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = self.thruster_explosive_force * phase_weight
-            thruster_angle = self.thruster_stabilization_angle * phase_weight
-            
-        elif time_in_sec < self.jump_preparation_time + 1.5:  # Flight phase
-            phase_weight = (time_in_sec - self.jump_preparation_time - 0.5) / 1.0
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'flight')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = self.thruster_explosive_force * 0.3  # reduced thrust for flight
-            thruster_angle = 0.0
-            
-        elif time_in_sec < self.jump_preparation_time + 2.5:  # Landing preparation
-            phase_weight = (time_in_sec - self.jump_preparation_time - 1.5) / 1.0
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'landing_prep')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = self.thruster_landing_force * phase_weight
-            thruster_angle = -self.thruster_stabilization_angle * phase_weight
-            
-        elif time_in_sec < self.jump_preparation_time + 3.5:  # Landing phase
-            phase_weight = (time_in_sec - self.jump_preparation_time - 2.5) / 1.0
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'landing')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = self.thruster_landing_force * (1.0 - phase_weight)
-            thruster_angle = 0.0
-            
-        else:  # Stabilization phase
-            phase_weight = min(1.0, (time_in_sec - self.jump_preparation_time - 3.5) / 0.5)
-            joint_angles = self.__calculate_kinematic_pose(phase_weight, 'stabilize')
-            
-            # Apply symmetric joint angles
-            ref_pose[3] = joint_angles['left_hip_pitch']
-            ref_pose[4] = joint_angles['left_knee']
-            ref_pose[8] = joint_angles['right_hip_pitch']
-            ref_pose[9] = joint_angles['right_knee']
-            thruster_force = 0.0
-            thruster_angle = 0.0
-        
-        # Create reference motion dictionary
-        ref_motion = {
-            'base_pos_global': ref_pose[:3],
-            'base_rot_global': ref_pose[3:6],
-            'motor_pos': ref_pose[6:],
-            'motor_vel': np.zeros(10),  # Zero velocity for hopping
-            'base_vel_local': np.zeros(3),  # Zero velocity for stationary hopping
-            'thruster_forces': [thruster_force, thruster_force],  # [left, right]
-            'thruster_angles': [thruster_angle, thruster_angle]   # [left, right]
-        }
-        
-        return ref_motion
