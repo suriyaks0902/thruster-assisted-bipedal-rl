@@ -119,6 +119,28 @@ def get_args():
     )
 
     parser.add_argument(
+        "--stage",
+        type=int,
+        default=1,
+        choices=[1, 2, 3],
+        help="Training stage per paper (1: single-skill, 2: task randomization, 3: dynamics randomization)",
+    )
+
+    parser.add_argument(
+        "--randomize_targets",
+        action="store_true",
+        default=False,
+        help="Enable Stage-2 target randomization (height/distance)",
+    )
+
+    parser.add_argument(
+        "--dynamics_randomization",
+        action="store_true",
+        default=False,
+        help="Enable Stage-3 dynamics randomization (incl. thruster params)",
+    )
+
+    parser.add_argument(
         "--visual",
         action="store_true",
         default=False,
@@ -188,12 +210,26 @@ def train(max_iters: int, use_gpu: bool = True, callback: Optional[Callable] = N
     hopping_config = config_train.copy()
     hopping_config.update({
         "hopping_mode": True,
+        "training_stage": args.stage,
         "thruster_enabled": True,
         "hop_target_height": args.hop_target_height,
         "hop_frequency": args.hop_frequency,
         "is_visual": args.visual,
         "max_timesteps": 1000,  # Shorter episodes for hopping
     })
+
+    # Stage-2 target ranges
+    if args.randomize_targets or args.stage >= 2:
+        hopping_config.update({
+            "height_range_stage2": [0.3, 1.5],
+            "distance_range_stage2": [0.0, 2.0],
+        })
+
+    # Stage-3 randomization flag
+    if args.dynamics_randomization or args.stage >= 3:
+        hopping_config.update({
+            "enable_dynamics_randomization": True,
+        })
     
     env = CassieEnv(config=hopping_config)
     
@@ -207,6 +243,9 @@ def train(max_iters: int, use_gpu: bool = True, callback: Optional[Callable] = N
     print(f"   - Timesteps per batch: {args.timesteps_per_batch}")
     print(f"   - Target hop height: {args.hop_target_height}m")
     print(f"   - Hopping frequency: {args.hop_frequency}Hz")
+    print(f"   - Stage: {args.stage}")
+    print(f"   - Randomize targets: {args.randomize_targets}")
+    print(f"   - Dynamics randomization: {args.dynamics_randomization}")
     print(f"   - GPU enabled: {use_gpu}")
     print(f"   - Visualization: {args.visual}")
 

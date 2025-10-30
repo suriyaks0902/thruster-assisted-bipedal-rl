@@ -1,9 +1,16 @@
 {
-  "waypoint_strategy": "random",
-  "sequence_type": "mixed",
+  "hopping_mode": true,
+  "training_stage": 1,
+  "thruster_enabled": true,
+  "hop_target_height": 1.0,
+  "landing_smoothness_threshold": 0.1,
+  "min_apex_ratio_stage1": 0.8,
+  "landing_velocity_threshold": 2.0,
+  "height_range_stage2": [0.3, 1.5],
+  "distance_range_stage2": [0.0, 2.0],
   "learning_rate": 1e-05,
   "max_iters": 100,
-  "timesteps_per_batch": 2048,
-  "batch_size": 64,
+  "timesteps_per_batch": 4096,
+  "batch_size": 512,
   "test_mode": false
 }

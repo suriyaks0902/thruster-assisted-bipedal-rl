@@ -63,20 +63,11 @@ class CassieEnv:
         self.thruster_pitches = [0.0, 0.0]  # [left, right]
         self.last_thruster_forces = [0.0, 0.0]  # For stability reward calculation
         
-        # Initialize waypoint system
-        self.waypoint_pos = np.array([0.0, 0.0, 0.9])  # [x, y, z] - default ground level
-        self.waypoint_type = "ground"  # "ground", "aerial", "mixed"
-        self.waypoint_reached = False
-        self.waypoint_threshold = 0.3  # meters - distance to consider waypoint reached
-        self.waypoint_reward_weight = 1.0  # weight for waypoint distance reward
-        
         # Store config for later use
         self.config = config
         
-        # Waypoint switching configuration
-        self.waypoint_strategy = config.get('waypoint_strategy', 'random')  # 'random', 'sequence', 'adaptive'
-        self.sequence_type = config.get('sequence_type', 'mixed')  # 'mixed', 'spiral', 'obstacle_course'
-        self.waypoint_switch_probability = config.get('waypoint_switch_probability', 0.1)  # Probability of switching waypoints
+        # Enable hopping mode by default for thruster-assisted jumping
+        self.hopping_mode = True
         self.sim_freq = 2000
         self.appx_env_freq = 30  # 30 hz but the real control frequency is not exactly 30Hz because we round up the num_sims_per_env_step
         self.num_sims_per_env_step = self.sim_freq // self.appx_env_freq
@@ -149,6 +140,7 @@ class CassieEnv:
                 "r_stability",
             ]
         else:
+            # Fallback to basic reward structure (though hopping_mode should be default)
             self.reward_names = [
                 "r_mpos",
                 "r_mvel",
@@ -163,7 +155,6 @@ class CassieEnv:
                 "r_acc",
                 "r_footpos",
                 "r_delta_acs",
-                "r_waypoint",
                 "r_thruster",
             ]
         w_mpos = 15.0
@@ -183,27 +174,50 @@ class CassieEnv:
         w_delta_acs_stand = 10.0
         # Check if in hopping mode for different reward weights
         if hasattr(self, 'hopping_mode') and self.hopping_mode:
+            # Paper-aligned stage selection (1,2,3)
+            stage = int(self.config.get('training_stage', 1))
             # Hopping-specific reward weights
             w_hop_height = 10.0  # Reward for achieving hop height
             w_landing_smoothness = 15.0  # Reward for smooth landing
             w_thruster_efficiency = 5.0  # Reward for efficient thruster use
             w_stability = 8.0  # Reward for maintaining stability
             
+            if stage == 1:
+                # Table III (Jumping, Stage 1): reduce motor tracking, disable vel, increase pose/orient
+                w_mpos_final = w_mpos - 7.5          # 7.5
+                w_ptrans_pos_final = w_ptrans_pos + 5.5   # 13.0
+                w_ptrans_velx_final = 0.0
+                w_ptrans_vely_final = 0.0
+                w_prot_pos_final = w_prot_pos + 2.5  # 12.5
+                w_prot_vel_final = w_prot_vel + 4.5  # 7.5
+                w_delta_acs_final = w_delta_acs_nonstand
+                w_motor_vel_final = w_mvel_nonstand + 3.0
+            else:
+                # Table III (Jumping, Stage 2/3): task completion emphasized, smoother actions
+                w_mpos_final = w_mpos - 2.5          # 12.5
+                w_ptrans_pos_final = w_ptrans_pos + 7.5  # 15.0
+                w_ptrans_velx_final = w_ptrans_velx - 2.5  # 5.0 nominal adjust
+                w_ptrans_vely_final = w_ptrans_vely - 2.5  # 5.0 nominal adjust
+                w_prot_pos_final = w_prot_pos
+                w_prot_vel_final = w_prot_vel + 7.0  # 10.0
+                w_delta_acs_final = w_delta_acs_nonstand + 7.0
+                w_motor_vel_final = w_mvel_nonstand
+
             w_array_nonstand = np.array(
                 [
-                    w_mpos * 0.5,  # Reduce motor position importance for hopping
-                    w_mvel_nonstand,
-                    w_ptrans_pos * 0.3,  # Reduce position tracking importance
-                    w_ptrans_velx * 0.3,
-                    w_ptrans_vely * 0.3,
-                    w_prot_pos * 2.0,  # Increase orientation importance for stability
-                    w_prot_vel * 2.0,
-                    w_ptrans_z * 0.5,  # Reduce Z position tracking
-                    w_torque * 0.5,  # Reduce torque penalty
-                    w_foot_force * 0.3,  # Reduce foot force importance
-                    w_acc * 0.5,  # Reduce acceleration penalty
-                    w_footpos * 0.5,  # Reduce foot position importance
-                    w_delta_acs_nonstand * 0.5,
+                    w_mpos_final,
+                    w_motor_vel_final,
+                    w_ptrans_pos_final,
+                    w_ptrans_velx_final,
+                    w_ptrans_vely_final,
+                    w_prot_pos_final,
+                    w_prot_vel_final,
+                    w_ptrans_z,  # keep nominal for Z
+                    w_torque,
+                    w_foot_force,
+                    w_acc,  # joint accel
+                    w_footpos,
+                    w_delta_acs_final,
                     w_hop_height,  # Hop height reward
                     w_landing_smoothness,  # Landing smoothness reward
                     w_thruster_efficiency,  # Thruster efficiency reward
@@ -212,7 +226,7 @@ class CassieEnv:
             )
             w_array_stand = w_array_nonstand.copy()  # Same weights for hopping
         else:
-            w_waypoint = 5.0  # Waypoint reward weight
+            # Fallback weights (basic walking with thrusters, no waypoints)
             w_thruster = 2.0  # Thruster reward weight
 
             w_array_nonstand = np.array(
@@ -230,7 +244,6 @@ class CassieEnv:
                     w_acc,
                     w_footpos,
                     w_delta_acs_nonstand,
-                    w_waypoint,  # Waypoint reward weight
                     w_thruster,  # Thruster reward weight
                 ]
             )
@@ -249,7 +262,6 @@ class CassieEnv:
                     w_acc,
                     w_footpos,
                     w_delta_acs_stand,
-                    w_waypoint,  # Waypoint reward weight
                     w_thruster,  # Thruster reward weight
                 ]
             )
@@ -393,25 +405,12 @@ class CassieEnv:
         self.__reset_consts()
         self.__reset_action_filter()
         
-        # Initialize hopping system if in hopping mode
-        if self.config.get('hopping_mode', False):
+        # Initialize hopping system (default mode for thruster-assisted jumping)
+        if self.hopping_mode:
             self.__init_hopping_system(self.config)
-        else:
-            # Initialize waypoint switching system
-            self.waypoint_reached_count = 0
-            
-            # Choose waypoint strategy (can be configured)
-            waypoint_strategy = getattr(self, 'waypoint_strategy', 'random')  # Default to random
-            
-            if waypoint_strategy == 'sequence':
-                # Use waypoint sequences for more complex navigation
-                sequence_type = getattr(self, 'sequence_type', 'mixed')
-                sequence = self.create_waypoint_sequence(sequence_type)
-                self.set_waypoint_sequence(sequence)
-            else:
-                # Use random waypoint generation
-                waypoint_type = np.random.choice(["ground", "aerial"], p=[0.7, 0.3])  # 70% ground, 30% aerial
-                self.generate_waypoint(waypoint_type)
+            # Stage thresholds
+            self.min_apex_ratio_stage1 = float(self.config.get('min_apex_ratio_stage1', 0.8))
+            self.landing_velocity_threshold = float(self.config.get('landing_velocity_threshold', 2.0))
         
         obs_vf, obs_pol = self.__get_observation(step=False)
         if self.observation_space_vf is None:
@@ -536,30 +535,10 @@ class CassieEnv:
 
         self.__update_data(step=True)
         
-        # Check if waypoint is reached and switch if needed
-        if self.is_waypoint_reached():
-            if hasattr(self, 'waypoint_sequence') and self.waypoint_sequence:
-                # Use sequence-based switching
-                if self.advance_waypoint_sequence():
-                    if hasattr(self, 'waypoint_reached_count'):
-                        self.waypoint_reached_count += 1
-                    else:
-                        self.waypoint_reached_count = 1
-            else:
-                # Use random switching
-                self.switch_waypoint(strategy="random")
-                if hasattr(self, 'waypoint_reached_count'):
-                    self.waypoint_reached_count += 1
-                else:
-                    self.waypoint_reached_count = 1
-        
         obs_vf, obs_pol = self.__get_observation(acs=actual_pTs, step=True)
         reward, reward_dict = self.__get_reward(acs=actual_pTs)
         done = self.__is_done() if not restore else False
         self.info["reward_dict"] = reward_dict
-        self.info["waypoint_reached"] = self.waypoint_reached
-        self.info["waypoint_type"] = self.waypoint_type
-        self.info["waypoint_pos"] = self.waypoint_pos.copy()
         self.last_acs = actual_pTs
         return obs_vf, obs_pol, reward, done, self.info
 
@@ -714,19 +693,11 @@ class CassieEnv:
         )
         obs_pol_hist = np.flip(np.asarray(self.long_history).T, 1)
 
-        # Add waypoint information to policy observation
-        waypoint_relative = self.waypoint_pos - self.qpos[:3]  # Relative waypoint position
-        waypoint_distance = np.array([self.get_distance_to_waypoint()])  # Distance to waypoint
-        waypoint_type_encoded = np.array([1.0 if self.waypoint_type == "aerial" else 0.0])  # Aerial flag
-        
-        obs_pol_base = np.concatenate([ob_prev, ob_curr, ob1, ob4, ob7, ob_command, waypoint_relative, waypoint_distance, waypoint_type_encoded])
+        # Policy observation (for jumping: includes reference motions and commands)
+        obs_pol_base = np.concatenate([ob_prev, ob_curr, ob1, ob4, ob7, ob_command])
         obs_pol = (obs_pol_base, obs_pol_hist)
 
-        # Add waypoint information to observation
-        waypoint_relative = self.waypoint_pos - self.qpos[:3]  # Relative waypoint position
-        waypoint_distance = np.array([self.get_distance_to_waypoint()])  # Distance to waypoint
-        waypoint_type_encoded = np.array([1.0 if self.waypoint_type == "aerial" else 0.0])  # Aerial flag
-        
+        # Value function observation (ground truth state for better value estimates)
         obs_vf = np.concatenate(
             [
                 ob_prev,
@@ -739,9 +710,6 @@ class CassieEnv:
                 np.array([self.qpos[2]]),
                 self.sim.get_foot_forces(),
                 self.env_randomlizer.get_rand_floor_friction(),
-                waypoint_relative,  # [x, y, z] relative waypoint position
-                waypoint_distance,  # [distance] to waypoint
-                waypoint_type_encoded,  # [aerial_flag] 1.0 if aerial, 0.0 if ground
             ]
         )
 
@@ -877,20 +845,13 @@ class CassieEnv:
 
         # Check if in hopping mode for different reward calculations
         if hasattr(self, 'hopping_mode') and self.hopping_mode:
-            # Hopping-specific rewards
+            # Hopping-specific rewards (for thruster-assisted jumping)
             r_hop_height = self.get_hop_height_reward()
             r_landing_smoothness = self.get_landing_smoothness_reward()
             r_thruster_efficiency = self.get_thruster_efficiency_reward()
             r_stability = self.get_stability_reward()
-        else:
-            # Waypoint reward
-            r_waypoint = self.get_waypoint_reward()
             
-            # Thruster reward
-            r_thruster = self.get_thruster_rewards()
-
-        # NOTE: should be in the same order with self.reward_weights
-        if hasattr(self, 'hopping_mode') and self.hopping_mode:
+            # NOTE: should be in the same order with self.reward_weights
             rewards = np.array(
                 [
                     r_mpos,
@@ -913,6 +874,9 @@ class CassieEnv:
                 ]
             )
         else:
+            # Fallback mode: basic walking with thrusters (no jumping)
+            r_thruster = self.get_thruster_rewards()
+            
             rewards = np.array(
                 [
                     r_mpos,
@@ -928,7 +892,6 @@ class CassieEnv:
                     r_acc,
                     r_footpos,
                     r_delta_acs,
-                    r_waypoint,  # Waypoint reward
                     r_thruster,  # Thruster reward
                 ]
             )
@@ -941,6 +904,10 @@ class CassieEnv:
             reward_dict = dict(
                 zip(self.reward_names, self.reward_weights_stand * rewards)
             )
+        # Expose key metrics for logging
+        self.info["apex_height"] = getattr(self, 'max_height_reached', self.qpos[2])
+        self.info["landing_velocity_z"] = float(abs(self.qvel[2]))
+        self.info["training_stage"] = int(self.config.get('training_stage', 1))
         return total_reward, reward_dict
 
     ##########################################
@@ -961,6 +928,17 @@ class CassieEnv:
         elif self.timestep >= self.max_timesteps:
             # print('max step reached:{}'.format(self.max_timesteps))
             return True
+        # Early termination for jumping curriculum
+        if self.hopping_mode:
+            stage = int(self.config.get('training_stage', 1))
+            # Stage-1: enforce minimum apex height by 3s
+            if stage == 1 and self.time_in_sec >= 3.0:
+                min_apex = self.min_apex_ratio_stage1 * float(self.config.get('hop_target_height', 1.0))
+                if getattr(self, 'max_height_reached', 0.0) < min_apex:
+                    return True
+            # Bad landing: excessive vertical speed on landing
+            if self.hop_phase == "landing" and abs(self.qvel[2]) > self.landing_velocity_threshold:
+                return True
         else:
             return False
 
@@ -1042,71 +1020,11 @@ class CassieEnv:
         return self.cassie_fk.get_foot_pos(motor_pos, base_pos, base_rot)
 
     ##########################################
-    #            Waypoint System             #
+    #        Thruster Rewards (Jumping)      #
     ##########################################
     
-    def generate_waypoint(self, waypoint_type="ground"):
-        """Generate a new waypoint based on type"""
-        if waypoint_type == "ground":
-            # Ground waypoint: random position at ground level
-            x = np.random.uniform(-2.0, 2.0)  # 4m range in x
-            y = np.random.uniform(-2.0, 2.0)  # 4m range in y
-            z = 0.9  # Ground level (robot height)
-        elif waypoint_type == "aerial":
-            # Aerial waypoint: random position above ground
-            x = np.random.uniform(-1.5, 1.5)  # Smaller range for aerial
-            y = np.random.uniform(-1.5, 1.5)
-            z = np.random.uniform(1.5, 3.0)  # 1.5m to 3m height
-        elif waypoint_type == "mixed":
-            # Mixed waypoint: random type
-            if np.random.random() < 0.5:
-                return self.generate_waypoint("ground")
-            else:
-                return self.generate_waypoint("aerial")
-        else:
-            raise ValueError(f"Unknown waypoint type: {waypoint_type}")
-        
-        self.waypoint_pos = np.array([x, y, z])
-        self.waypoint_type = waypoint_type
-        self.waypoint_reached = False
-        return self.waypoint_pos
-    
-    def get_distance_to_waypoint(self):
-        """Calculate distance to current waypoint"""
-        robot_pos = self.qpos[:3]  # [x, y, z]
-        distance = np.linalg.norm(robot_pos - self.waypoint_pos)
-        return distance
-    
-    def is_waypoint_reached(self):
-        """Check if waypoint has been reached"""
-        distance = self.get_distance_to_waypoint()
-        if distance < self.waypoint_threshold:
-            self.waypoint_reached = True
-            return True
-        return False
-    
-    def get_waypoint_reward(self):
-        """Calculate waypoint-based reward"""
-        distance = self.get_distance_to_waypoint()
-        
-        # Distance reward (negative - closer is better)
-        distance_reward = -distance * self.waypoint_reward_weight
-        
-        # Success reward (bonus for reaching waypoint)
-        success_reward = 0.0
-        if self.is_waypoint_reached():
-            success_reward = 10.0  # Large bonus for reaching waypoint
-        
-        # Height tracking reward for aerial waypoints
-        height_reward = 0.0
-        if self.waypoint_type == "aerial":
-            height_diff = abs(self.qpos[2] - self.waypoint_pos[2])
-            height_reward = -height_diff * 0.5  # Penalty for height deviation
-        
-        return distance_reward + success_reward + height_reward
-    
     def get_thruster_rewards(self):
-        """Calculate thruster-specific rewards"""
+        """Calculate thruster-specific rewards (for basic walking mode only)"""
         # Thruster force magnitude (penalty for excessive force)
         total_thruster_force = abs(self.thruster_forces[0]) + abs(self.thruster_forces[1])
         force_efficiency_reward = -total_thruster_force * 0.001  # Penalty for high force usage
@@ -1123,25 +1041,10 @@ class CassieEnv:
         else:
             stability_reward = 0.0
         
-        # Context-aware thruster rewards
-        context_reward = 0.0
-        if self.waypoint_type == "ground":
-            # For ground waypoints, penalize unnecessary thruster usage
-            if total_thruster_force > 50:  # More than 50N total force
-                context_reward = -total_thruster_force * 0.002  # Extra penalty
-        elif self.waypoint_type == "aerial":
-            # For aerial waypoints, reward appropriate thruster usage
-            height_diff = self.waypoint_pos[2] - self.qpos[2]
-            if height_diff > 0.5:  # Need to go up
-                if total_thruster_force > 100:  # Good thruster usage
-                    context_reward = 0.1  # Small bonus for appropriate usage
-            else:
-                context_reward = -total_thruster_force * 0.001  # Penalty for unnecessary force
-        
         # Store current thruster forces for next step
         self.last_thruster_forces = self.thruster_forces.copy()
         
-        return force_efficiency_reward + pitch_efficiency_reward + stability_reward + context_reward
+        return force_efficiency_reward + pitch_efficiency_reward + stability_reward
 
     def __check_simulation_stability(self):
         """Check for simulation instability (NaN/Inf values) with enhanced checks"""
@@ -1185,110 +1088,6 @@ class CassieEnv:
             print(f"⚠️ Exception in stability check: {e}")
             return True
 
-    def switch_waypoint(self, strategy="random"):
-        """Switch to a new waypoint based on strategy"""
-        if strategy == "random":
-            # Randomly choose between ground and aerial waypoints
-            waypoint_type = np.random.choice(["ground", "aerial"], p=[0.6, 0.4])  # Slightly favor ground
-        elif strategy == "sequential":
-            # Alternate between ground and aerial
-            if self.waypoint_type == "ground":
-                waypoint_type = "aerial"
-            else:
-                waypoint_type = "ground"
-        elif strategy == "adaptive":
-            # Switch based on current performance
-            if hasattr(self, 'waypoint_reached_count'):
-                if self.waypoint_reached_count > 3:  # If reaching waypoints easily
-                    waypoint_type = "aerial"  # Make it harder
-                else:
-                    waypoint_type = "ground"  # Keep it easier
-            else:
-                waypoint_type = "ground"
-        else:
-            waypoint_type = "ground"  # Default to ground
-        
-        # Generate new waypoint
-        self.generate_waypoint(waypoint_type)
-        
-        # Reset waypoint reached flag
-        self.waypoint_reached = False
-        
-        return waypoint_type
-
-    def create_waypoint_sequence(self, sequence_type="mixed"):
-        """Create a sequence of waypoints for complex navigation"""
-        if sequence_type == "mixed":
-            # Create a mixed sequence: ground -> aerial -> ground
-            sequence = [
-                {"type": "ground", "pos": [2.0, 0.0, 0.9]},
-                {"type": "aerial", "pos": [4.0, 0.0, 1.5]},
-                {"type": "ground", "pos": [6.0, 0.0, 0.9]},
-                {"type": "aerial", "pos": [8.0, 0.0, 2.0]},
-            ]
-        elif sequence_type == "spiral":
-            # Create a spiral pattern
-            sequence = []
-            for i in range(5):
-                angle = i * 0.5 * np.pi
-                radius = 1.0 + i * 0.5
-                x = radius * np.cos(angle)
-                y = radius * np.sin(angle)
-                z = 0.9 + i * 0.3
-                sequence.append({
-                    "type": "aerial" if i % 2 == 1 else "ground",
-                    "pos": [x, y, z]
-                })
-        elif sequence_type == "obstacle_course":
-            # Create an obstacle course pattern
-            sequence = [
-                {"type": "ground", "pos": [1.0, 0.0, 0.9]},
-                {"type": "aerial", "pos": [2.0, 0.0, 1.2]},
-                {"type": "ground", "pos": [3.0, 1.0, 0.9]},
-                {"type": "aerial", "pos": [4.0, 1.0, 1.5]},
-                {"type": "ground", "pos": [5.0, 0.0, 0.9]},
-            ]
-        else:
-            # Default mixed sequence
-            sequence = [
-                {"type": "ground", "pos": [2.0, 0.0, 0.9]},
-                {"type": "aerial", "pos": [4.0, 0.0, 1.5]},
-            ]
-        
-        return sequence
-
-    def set_waypoint_sequence(self, sequence):
-        """Set a sequence of waypoints to follow"""
-        self.waypoint_sequence = sequence
-        self.current_waypoint_index = 0
-        self.waypoint_reached_count = 0
-        
-        # Set the first waypoint
-        if sequence:
-            first_waypoint = sequence[0]
-            self.waypoint_type = first_waypoint["type"]
-            self.waypoint_pos = np.array(first_waypoint["pos"])
-            self.waypoint_reached = False
-
-    def advance_waypoint_sequence(self):
-        """Advance to the next waypoint in the sequence"""
-        if hasattr(self, 'waypoint_sequence') and self.waypoint_sequence:
-            self.current_waypoint_index += 1
-            
-            if self.current_waypoint_index < len(self.waypoint_sequence):
-                # Move to next waypoint in sequence
-                next_waypoint = self.waypoint_sequence[self.current_waypoint_index]
-                self.waypoint_type = next_waypoint["type"]
-                self.waypoint_pos = np.array(next_waypoint["pos"])
-                self.waypoint_reached = False
-                return True
-            else:
-                # Sequence completed, generate new random sequence
-                new_sequence = self.create_waypoint_sequence("mixed")
-                self.set_waypoint_sequence(new_sequence)
-                return True
-        
-        return False
 
     def get_tarsus_pos(self, base_pos, base_rot, motor_pos):
         return self.cassie_fk.get_tarsus_pos(motor_pos, base_pos, base_rot)
